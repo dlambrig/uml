@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PATH=/usr/local/bin:/usr/bin:/bin
+
+N="${1:-400}"                               # how many alerts to analyze
+MODEL="${MODEL:-opencode/grok-code}"        # model to use
+PROMPT_FILE="${2:-/root/system_prompt.txt}" # system prompt file
+
+SUM="/tmp/ossec_summary.json"
+MSGS="/tmp/opencode_messages.json"
+RAW="/tmp/opencode_raw.out"
+
+# 1) Collect + analyze + compact
+sudo /var/ossec/bin/ossec-collect "$N" \
+| sudo /var/ossec/bin/ossec-analyze \
+| /usr/bin/jq -c . > "$SUM"
+
+# 2) Build a messages array: [{system:...},{user:...}]
+/usr/bin/jq -n \
+  --arg sys "$(cat "$PROMPT_FILE")" \
+  --arg usr "$(cat "$SUM")" \
+  '[{"role":"system","content":$sys},{"role":"user","content":$usr}]' \
+  | /usr/bin/jq -c . > "$MSGS"
+
+# 3) Call opencode. Prefer JSON output; else fall back to stream.
+if /usr/local/bin/opencode run -m "$MODEL" --format json "$(cat "$MSGS")" > "$RAW" 2>/dev/null; then
+  :
+else
+  /usr/local/bin/opencode run -m "$MODEL" "$(cat "$MSGS")" > "$RAW" 2>/dev/null || true
+fi
+
+# 4) Try shapes in order. If none match, print raw for debugging.
+
+# a) messages array: [ {role, content}, ... ]
+if /usr/bin/jq -er 'type=="array" and (.[0]?|has("role"))' "$RAW" >/dev/null 2>&1; then
+  /usr/bin/jq -r '.[] | select(.role=="assistant" and .content!=null) | .content' "$RAW"
+  exit 0
+fi
+
+# b) object with messages: { messages: [...] }
+if /usr/bin/jq -er 'type=="object" and has("messages")' "$RAW" >/dev/null 2>&1; then
+  /usr/bin/jq -r '.messages[] | select(.role=="assistant" and .content!=null) | .content' "$RAW"
+  exit 0
+fi
+
+# c) event-stream NDJSON: pull only text parts, de-dup, join
+TXT="$(/usr/bin/jq -r 'select(.type?=="text") | (.part.text // .text.text // .text // .content)' "$RAW" \
+      | /usr/bin/awk 'NF{print}' \
+      | /usr/bin/awk '!seen[$0]++')"
+
+if [ -n "$TXT" ]; then
+  printf '%s\n' "$TXT"
+  exit 0
+fi
+
+# d) last resort: show raw (so you can see what shape came back)
+cat "$RAW"
