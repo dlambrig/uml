@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -u
+N="${1:-200}"
+LOG=/var/ossec/logs/alerts/alerts.json
+[ -r "$LOG" ] || { echo "Missing $LOG" >&2; exit 1; }
+/usr/bin/tail -n "$N" "$LOG" | /usr/bin/jq -s '.'
